@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/aicore-protocol",
+    "crates/aicore-storage",
+    "crates/aicore-auth",
+    "crates/aicore-providers/chatgpt",
+    "crates/aicore-core",
+    "crates/aicore-server",
+    "crates/aicore-cli",
+]
