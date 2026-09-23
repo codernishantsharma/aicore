@@ -18,7 +18,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -33,6 +33,12 @@ cookie = "0.18"
 sha2 = "0.10"
 futures-util = "0.3"
 tokio-util = { version = "0.7", features = ["codec"] }
+
+aicore-protocol = { path = "../crates/aicore-protocol" }
+aicore-storage = { path = "../crates/aicore-storage" }
+aicore-auth = { path = "../crates/aicore-auth" }
+aicore-provider-chatgpt = { path = "../crates/aicore-providers/chatgpt" }
+aicore-core = { path = "../crates/aicore-core" }
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
