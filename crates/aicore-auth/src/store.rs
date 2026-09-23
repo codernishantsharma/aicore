@@ -27,6 +27,23 @@ pub struct SessionData {
     pub cookies: Option<String>,
 }
 
+impl SessionData {
+    pub fn get_user_info(&self) -> serde_json::Value {
+        if let Some(user) = self.auth_session.get("user") {
+            let id = user.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+            let name = user.get("name").and_then(|v| v.as_str()).unwrap_or_default();
+            let email = user.get("email").and_then(|v| v.as_str()).unwrap_or_default();
+            serde_json::json!({
+                "id": id,
+                "name": name,
+                "email": email,
+            })
+        } else {
+            serde_json::Value::Null
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct StoredFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]

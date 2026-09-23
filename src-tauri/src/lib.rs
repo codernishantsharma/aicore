@@ -1,229 +1,112 @@
-// AI Core - Reverse-engineered ChatGPT access layer
-// Provides: authenticated web session management, encrypted storage, Unix socket IPC
+// AICore — Persistent ChatGPT WebView Background App
+// Provides: authenticated web session management, system tray, encrypted storage, Unix socket IPC
 
-use aes_gcm::{
-    aead::{Aead, KeyInit},
-    Aes256Gcm, Key, Nonce,
-};
+use aicore_auth::{clear_session, load_session, save_session, SessionData};
+use aicore_core::RequestRouter;
+use aicore_protocol::{Request as ProtocolRequest, Response as ProtocolResponse, PROTOCOL_VERSION};
+use aicore_storage::Storage;
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-use directories::ProjectDirs;
-use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     fs,
     path::PathBuf,
     sync::Arc,
+    time::Duration,
 };
-use tauri::{Manager, WebviewWindow};
+use tauri::{
+    menu::{Menu, MenuItem},
+    tray::TrayIconBuilder,
+    AppHandle, Manager, WebviewWindow,
+};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
-    sync::Mutex,
+    sync::{mpsc, Mutex},
 };
 use url::Url;
 
-// ---------------------------------------------------------------------------
-// Encryption
-// ---------------------------------------------------------------------------
-
-struct Crypto {
-    cipher: Aes256Gcm,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AuthState {
+    Starting,
+    InitializingWebview,
+    CheckingSession,
+    Authenticated,
+    Unauthenticated,
+    LoginRequired,
+    UserLogin,
+    Ready,
+    Background,
 }
-
-impl Crypto {
-    fn new(key_bytes: &[u8; 32]) -> Self {
-        let key = Key::<Aes256Gcm>::from_slice(key_bytes);
-        Self { cipher: Aes256Gcm::new(key) }
-    }
-
-    fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>, String> {
-        let mut nonce_bytes = [0u8; 12];
-        rand::thread_rng().fill_bytes(&mut nonce_bytes);
-        let nonce = Nonce::from_slice(&nonce_bytes);
-        let ciphertext = self.cipher.encrypt(nonce, plaintext)
-            .map_err(|e| format!("encrypt failed: {e}"))?;
-        let mut out = Vec::with_capacity(12 + ciphertext.len());
-        out.extend_from_slice(&nonce_bytes);
-        out.extend_from_slice(&ciphertext);
-        Ok(out)
-    }
-
-    fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>, String> {
-        if data.len() < 12 + 16 {
-            return Err("ciphertext too short".to_string());
-        }
-        let (nonce_bytes, ciphertext) = data.split_at(12);
-        let nonce = Nonce::from_slice(nonce_bytes);
-        self.cipher.decrypt(nonce, ciphertext)
-            .map_err(|e| format!("decrypt failed: {e}"))
-    }
-}
-
-fn derive_key_from_seed(seed: &str) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(seed.as_bytes());
-    let salt = b"ai-core-chatgpt-session-v1";
-    hasher.update(salt);
-    let d1 = hasher.finalize();
-    let mut h2 = Sha256::new();
-    h2.update(d1);
-    h2.update(salt);
-    let d2 = h2.finalize();
-    let mut k = [0u8; 32];
-    k.copy_from_slice(&d2);
-    k
-}
-
-fn generate_random_key() -> [u8; 32] {
-    let mut k = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut k);
-    k
-}
-
-// ---------------------------------------------------------------------------
-// Session storage
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct SessionData {
-    stored_at: u64,
-    auth_session: serde_json::Value,
-    device_id: Option<String>,
-    access_token: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct StoredFile {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    wrapped_key: Option<String>,
-    payload: String,
-}
-
-fn data_dir() -> PathBuf {
-    ProjectDirs::from("in", "nishant", "ai-core")
-        .map(|d| d.data_dir().to_path_buf())
-        .unwrap_or_else(|| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-            PathBuf::from(home).join(".ai-core")
-        })
-}
-
-fn session_file() -> PathBuf {
-    data_dir().join("session.enc.json")
-}
-
-fn key_file() -> PathBuf {
-    data_dir().join("key.bin")
-}
-
-fn load_or_create_key() -> [u8; 32] {
-    let kf = key_file();
-    if kf.exists() {
-        if let Ok(bytes) = fs::read(&kf) {
-            if bytes.len() == 32 {
-                let mut k = [0u8; 32];
-                k.copy_from_slice(&bytes);
-                return k;
-            }
-        }
-    }
-    let seed = std::fs::read_to_string("/etc/machine-id")
-        .or_else(|_| std::fs::read_to_string("/var/lib/dbus/machine-id"))
-        .unwrap_or_else(|_| {
-            let k = generate_random_key();
-            let _ = fs::create_dir_all(kf.parent().unwrap());
-            let _ = fs::write(&kf, &k);
-            return B64.encode(k);
-        });
-    let seed = seed.trim().to_string();
-    let key = derive_key_from_seed(&seed);
-    let _ = fs::create_dir_all(kf.parent().unwrap());
-    let _ = fs::write(&kf, &key);
-    key
-}
-
-fn save_session(session: &SessionData) -> Result<(), String> {
-    let key = load_or_create_key();
-    let crypto = Crypto::new(&key);
-    let plain = serde_json::to_vec(session).map_err(|e| e.to_string())?;
-    let enc = crypto.encrypt(&plain)?;
-    let sf = session_file();
-    let _ = fs::create_dir_all(sf.parent().unwrap());
-    let stored = StoredFile { wrapped_key: None, payload: B64.encode(enc) };
-    let json = serde_json::to_string_pretty(&stored).map_err(|e| e.to_string())?;
-    fs::write(&sf, json).map_err(|e| e.to_string())
-}
-
-fn load_session() -> Option<SessionData> {
-    let sf = session_file();
-    if !sf.exists() {
-        return None;
-    }
-    let json = fs::read_to_string(&sf).ok()?;
-    let stored: StoredFile = serde_json::from_str(&json).ok()?;
-    let enc = B64.decode(stored.payload.as_bytes()).ok()?;
-    let key = load_or_create_key();
-    let crypto = Crypto::new(&key);
-    let plain = crypto.decrypt(&enc).ok()?;
-    serde_json::from_slice(&plain).ok()
-}
-
-fn clear_session() {
-    let sf = session_file();
-    let _ = fs::remove_file(&sf);
-}
-
-// ---------------------------------------------------------------------------
-// App state
-// ---------------------------------------------------------------------------
 
 #[derive(Default)]
-struct AppState {
-    webview: Arc<Mutex<Option<WebviewWindow>>>,
-    session: Arc<Mutex<Option<SessionData>>>,
-    pending_calls: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<String>>>>,
-    login_notifier: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+struct AppStateInternal {
+    auth_state: AuthState,
+    session: Option<SessionData>,
+    webview: Option<WebviewWindow>,
+    pending_calls: HashMap<String, tokio::sync::oneshot::Sender<String>>,
+    login_notifier: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
-// ---------------------------------------------------------------------------
-// Auth flow
-// ---------------------------------------------------------------------------
+impl Default for AuthState {
+    fn default() -> Self {
+        AuthState::Starting
+    }
+}
 
-fn is_home_url(raw: &str) -> bool {
-    let Ok(u) = Url::parse(raw) else {
+#[derive(Clone, Default)]
+pub struct AppState {
+    inner: Arc<Mutex<AppStateInternal>>,
+    router: Arc<Mutex<Option<Arc<RequestRouter>>>>,
+}
+
+fn determine_socket_path() -> PathBuf {
+    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
+        PathBuf::from(dir).join("aicore.sock")
+    } else {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        PathBuf::from(home).join(".ai-core").join("aicore.sock")
+    }
+}
+
+fn set_socket_permissions(path: &PathBuf) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = fs::Permissions::from_mode(0o700);
+        let _ = fs::set_permissions(path, perms);
+    }
+}
+
+fn is_chatgpt_host(url_str: &str) -> bool {
+    let Ok(u) = Url::parse(url_str) else {
         return false;
     };
-    let host = u.host_str().unwrap_or_default();
-    if !(host == "chatgpt.com" || host.ends_with(".chatgpt.com")) {
+    if u.scheme() != "https" {
         return false;
     }
-    matches!(u.path(), "" | "/")
+    let host = u.host_str().unwrap_or_default();
+    host == "chatgpt.com" || host.ends_with(".chatgpt.com")
+}
+
+fn is_chatgpt_root(url_str: &str) -> bool {
+    let Ok(u) = Url::parse(url_str) else {
+        return false;
+    };
+    if u.scheme() != "https" {
+        return false;
+    }
+    let host = u.host_str().unwrap_or_default();
+    if !(host == "chatgpt.com" || host == "www.chatgpt.com") {
+        return false;
+    }
+    let path = u.path();
+    path.is_empty() || path == "/"
 }
 
 fn build_injected_js() -> String {
-    let engine_path = std::env::current_dir()
-        .ok()
-        .and_then(|cwd| {
-            let c1 = cwd.join("../../../chatgpt.js");
-            if c1.exists() {
-                return Some(c1);
-            }
-            let c2 = cwd.parent()?.join("chatgpt.js");
-            if c2.exists() {
-                return Some(c2);
-            }
-            None
-        });
-
-    let engine_src = if let Some(p) = engine_path {
-        fs::read_to_string(&p).unwrap_or_default()
-    } else {
-        String::new()
-    };
-
-    let bridge = r#"
+    r#"
 (function () {
   if (window.__aiCoreBridgeInstalled) return;
   window.__aiCoreBridgeInstalled = true;
@@ -242,49 +125,27 @@ fn build_injected_js() -> String {
 
   async function __aiCoreCall(method, params) {
     const P = params || {};
-    const E = window.__fluxnotesChatGPT;
     try {
       let r;
       switch (method) {
         case "auth_status":
-          r = { loggedIn: !!E, session: window.__aiCoreSession || null };
-          break;
-        case "chat_send":
-          r = E && await E.send(P.message, P.engine, P.attachments, P.sessionId);
-          break;
-        case "chat_new_conversation":
-          r = E && E.newConversation(P.sessionId);
-          r = { ok: true };
-          break;
-        case "chat_upload_file":
-          r = E && await E.uploadFileToChatGPT(P.fileBase64, P.filename, P.mimeType);
-          r = { fileId: r };
-          break;
-        case "chat_get_session":
-          r = E && E.getSession(P.sessionId);
-          break;
-        case "chat_set_session":
-          r = E && E.setSession(P.sessionId, P.session);
-          r = { ok: true };
-          break;
-        case "chat_download_sandbox_image":
-          r = E && await E.downloadSandboxImage(P.imagePath, P.messageId, P.sessionId);
+          r = { loggedIn: !!window.__aiCoreSession, session: window.__aiCoreSession || null };
           break;
         case "raw_auth_session": {
-          const res = await fetch("/api/auth/session", { credentials: "include" });
+          const res = await fetch("https://chatgpt.com/api/auth/session", { credentials: "include" });
           if (!res.ok) throw new Error("session fetch HTTP " + res.status);
           const data = await res.json();
           window.__aiCoreSession = data;
           let did = null;
           try {
             const cs = document.cookie.split(";").map(c => c.trim());
-            for (const c of cs) if (c.startsWith("oai-did=")) did = c.slice(7);
+            for (const c of cs) if (c.startsWith("oai-did=")) did = c.slice(8);
           } catch (_) {}
           r = { auth_session: data, device_id: did };
           break;
         }
         default:
-          throw new Error("unknown method: " + method);
+          throw new Error("unknown bridge method: " + method);
       }
       return JSON.stringify({ ok: true, result: r === undefined ? null : r });
     } catch (err) {
@@ -304,24 +165,23 @@ fn build_injected_js() -> String {
     }
   };
 })();
-"#;
-
-    format!("{engine_src}\n{bridge}")
+"#.to_string()
 }
 
 fn register_navigation_handler(win: &WebviewWindow, state: AppState) -> Result<(), String> {
-    let pending = state.pending_calls.clone();
-    let login_tx = state.login_notifier.clone();
+    let state_clone = state.clone();
 
     win.on_navigation(move |url, _evt| {
         let s = url.as_str();
 
-        if is_home_url(s) {
-            if let Ok(mut g) = login_tx.try_lock() {
-                if let Some(tx) = g.take() {
+        if is_chatgpt_root(s) {
+            let st = state_clone.clone();
+            tauri::async_runtime::spawn(async move {
+                let mut inner = st.inner.lock().await;
+                if let Some(tx) = inner.login_notifier.take() {
                     let _ = tx.send(());
                 }
-            }
+            });
         }
 
         if s.starts_with("aicores://") {
@@ -335,7 +195,6 @@ fn register_navigation_handler(win: &WebviewWindow, state: AppState) -> Result<(
                         .map(|(_, v)| v.to_string())
                         .unwrap_or_default();
                     if !nonce.is_empty() {
-                        use base64::Engine as _;
                         let decoded = B64
                             .decode(payload_b64.as_bytes())
                             .ok()
@@ -343,11 +202,13 @@ fn register_navigation_handler(win: &WebviewWindow, state: AppState) -> Result<(
                             .unwrap_or_else(|| {
                                 format!(r#"{{"ok":false,"error":"bad payload encoding"}}"#)
                             });
-                        if let Ok(mut p) = pending.try_lock() {
-                            if let Some(tx) = p.remove(&nonce) {
+                        let state = state_clone.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let mut inner = state.inner.lock().await;
+                            if let Some(tx) = inner.pending_calls.remove(&nonce) {
                                 let _ = tx.send(decoded);
                             }
-                        }
+                        });
                     }
                 }
             }
@@ -362,14 +223,15 @@ fn register_navigation_handler(win: &WebviewWindow, state: AppState) -> Result<(
 
 async fn webview_rpc(
     win: &WebviewWindow,
-    pending: &Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<String>>>>,
+    pending: &Arc<Mutex<AppStateInternal>>,
     method: &str,
     params: &serde_json::Value,
 ) -> Result<String, String> {
     let nonce = format!("{}", rand::random::<u64>());
     let (tx, rx) = tokio::sync::oneshot::channel();
     {
-        pending.lock().await.insert(nonce.clone(), tx);
+        let mut inner = pending.lock().await;
+        inner.pending_calls.insert(nonce.clone(), tx);
     }
     let params_json = params.to_string();
     let expr = format!(
@@ -386,12 +248,12 @@ async fn webview_rpc(
     );
     win.eval(&expr).map_err(|e| format!("eval failed: {e}"))?;
 
-    match tokio::time::timeout(std::time::Duration::from_secs(600), rx).await {
+    match tokio::time::timeout(Duration::from_secs(30), rx).await {
         Ok(Ok(s)) => Ok(s),
         Ok(Err(_)) => Err("rpc channel closed".to_string()),
         Err(_) => {
-            let mut p = pending.lock().await;
-            p.remove(&nonce);
+            let mut inner = pending.lock().await;
+            inner.pending_calls.remove(&nonce);
             Err("rpc timed out".to_string())
         }
     }
@@ -399,42 +261,47 @@ async fn webview_rpc(
 
 async fn capture_session_via_webview(
     win: &WebviewWindow,
-    pending: &Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<String>>>>,
+    state_internal: &Arc<Mutex<AppStateInternal>>,
 ) -> Result<SessionData, String> {
     let js = build_injected_js();
     let _ = win.eval(&js);
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let raw = webview_rpc(win, pending, "raw_auth_session", &serde_json::json!({})).await?;
-    let parsed: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|e| format!("bad session json: {e}"))?;
+    let raw = webview_rpc(win, state_internal, "raw_auth_session", &serde_json::json!({})).await?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("bad session json: {e}"))?;
 
     if parsed.get("ok").and_then(|v| v.as_bool()) != Some(true) {
         return Err(parsed
             .get("error")
             .and_then(|v| v.as_str())
-            .unwrap_or("unknown session error")
+            .unwrap_or("unauthenticated session response")
             .to_string());
     }
+
     let result = parsed.get("result").cloned().unwrap_or_default();
     let auth_session = result
         .get("auth_session")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
-    let device_id = result
-        .get("device_id")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+
     let access_token = auth_session
         .get("accessToken")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    if access_token.is_none() {
-        return Err("session did not contain accessToken; not logged in?".to_string());
+    let user_val = auth_session.get("user");
+
+    if access_token.is_none() || user_val.is_none() || user_val.unwrap().is_null() {
+        return Err("session does not contain valid user/accessToken".to_string());
     }
 
-    Ok(SessionData {
+    let device_id = result
+        .get("device_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let session_data = SessionData {
         stored_at: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -442,13 +309,16 @@ async fn capture_session_via_webview(
         auth_session,
         device_id,
         access_token,
-    })
+        cookies: None,
+    };
+
+    Ok(session_data)
 }
 
-async fn run_auth_flow(app_handle: tauri::AppHandle, state: &AppState) -> Result<(), String> {
-    let (tx, rx) = tokio::sync::oneshot::channel();
+pub async fn trigger_login(app_handle: &AppHandle, state: &AppState) -> Result<(), String> {
     {
-        *state.login_notifier.lock().await = Some(tx);
+        let mut inner = state.inner.lock().await;
+        inner.auth_state = AuthState::LoginRequired;
     }
 
     let win = app_handle
@@ -458,412 +328,442 @@ async fn run_auth_flow(app_handle: tauri::AppHandle, state: &AppState) -> Result
     let _ = win.show();
     let _ = win.navigate(Url::parse("https://chatgpt.com/auth/login").unwrap());
 
-    tokio::time::timeout(std::time::Duration::from_secs(600), rx)
-        .await
-        .map_err(|_| "login timed out".to_string())?
-        .map_err(|_| "login channel closed".to_string())?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    {
+        let mut inner = state.inner.lock().await;
+        inner.login_notifier = Some(tx);
+        inner.auth_state = AuthState::UserLogin;
+    }
 
-    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    let _ = tokio::time::timeout(Duration::from_secs(600), rx).await;
 
-    let sess = capture_session_via_webview(&win, &state.pending_calls).await?;
-    save_session(&sess)?;
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
-    *state.session.lock().await = Some(sess);
-    let _ = win.hide();
-    *state.webview.lock().await = Some(win);
-    Ok(())
+    {
+        let mut inner = state.inner.lock().await;
+        inner.auth_state = AuthState::CheckingSession;
+    }
+
+    match capture_session_via_webview(&win, &state.inner).await {
+        Ok(sess) => {
+            let _ = save_session(&sess);
+            let mut inner = state.inner.lock().await;
+            inner.session = Some(sess);
+            inner.auth_state = AuthState::Ready;
+            let _ = win.hide();
+            Ok(())
+        }
+        Err(e) => {
+            let mut inner = state.inner.lock().await;
+            inner.auth_state = AuthState::LoginRequired;
+            Err(e)
+        }
+    }
 }
 
-async fn try_restore_without_ui(
-    app_handle: &tauri::AppHandle,
-    state: &AppState,
-) -> Result<bool, String> {
-    if load_session().is_none() {
-        return Ok(false);
-    }
+pub async fn trigger_logout(app_handle: &AppHandle, state: &AppState) -> Result<(), String> {
+    clear_session();
 
     let win = app_handle
         .get_webview_window("main")
         .ok_or_else(|| "main window not found".to_string())?;
-    let _ = win.navigate(Url::parse("https://chatgpt.com/").unwrap());
-    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
-    match capture_session_via_webview(&win, &state.pending_calls).await {
-        Ok(new_sess) => {
-            save_session(&new_sess)?;
-            *state.session.lock().await = Some(new_sess);
-            *state.webview.lock().await = Some(win.clone());
+    let _ = win.show();
+    let _ = win.navigate(Url::parse("https://chatgpt.com/auth/login").unwrap());
+
+    let mut inner = state.inner.lock().await;
+    inner.session = None;
+    inner.auth_state = AuthState::LoginRequired;
+
+    Ok(())
+}
+
+async fn initialize_and_check_session(app_handle: AppHandle, state: AppState) {
+    {
+        let mut inner = state.inner.lock().await;
+        inner.auth_state = AuthState::InitializingWebview;
+    }
+
+    let win = match app_handle.get_webview_window("main") {
+        Some(w) => w,
+        None => return,
+    };
+
+    {
+        let mut inner = state.inner.lock().await;
+        inner.webview = Some(win.clone());
+    }
+
+    let _ = win.navigate(Url::parse("https://chatgpt.com/").unwrap());
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    {
+        let mut inner = state.inner.lock().await;
+        inner.auth_state = AuthState::CheckingSession;
+    }
+
+    match capture_session_via_webview(&win, &state.inner).await {
+        Ok(sess) => {
+            let _ = save_session(&sess);
+            let mut inner = state.inner.lock().await;
+            inner.session = Some(sess);
+            inner.auth_state = AuthState::Ready;
             let _ = win.hide();
-            Ok(true)
+            println!("[ai-core] ChatGPT WebView session verified and active");
         }
-        Err(_) => {
+        Err(e) => {
+            println!("[ai-core] Session unauthenticated or expired ({e}); navigating to login");
             clear_session();
-            Ok(false)
+            let _ = trigger_login(&app_handle, &state).await;
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Unix socket JSON-RPC server
+// Socket dispatch & JSON-RPC handling
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
-struct SocketRequest {
+struct SocketReq {
+    #[serde(default)]
+    version: Option<u32>,
     id: Option<serde_json::Value>,
     method: String,
     #[serde(default)]
-    params: Option<serde_json::Map<String, serde_json::Value>>,
+    params: serde_json::Value,
 }
 
-#[derive(Debug, Serialize)]
-struct SocketResponse<'a> {
-    id: Option<&'a serde_json::Value>,
-    #[serde(flatten)]
-    body: SocketResponseBody,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(untagged)]
-enum SocketResponseBody {
-    Result { result: serde_json::Value },
-    Error { error: SocketError },
-}
-
-#[derive(Debug, Serialize)]
-struct SocketError {
-    code: i32,
-    message: String,
-}
-
-fn socket_path() -> PathBuf {
-    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
-        PathBuf::from(dir).join("ai-core.sock")
-    } else {
-        let d = data_dir();
-        let _ = fs::create_dir_all(&d);
-        d.join("ai-core.sock")
-    }
-}
-
-async fn dispatch_call(
+async fn dispatch_socket_request(
+    app_handle: &AppHandle,
     state: &AppState,
-    method: &str,
-    params: Option<serde_json::Map<String, serde_json::Value>>,
-) -> SocketResponseBody {
-    if method == "auth_status" {
-        let sess = state.session.lock().await;
-        let has_webview = state.webview.lock().await.is_some();
-        let info = serde_json::json!({
-            "loggedIn": sess.is_some(),
-            "hasWebview": has_webview,
-            "storedAt": sess.as_ref().map(|s| s.stored_at),
-            "hasAccessToken": sess.as_ref().and_then(|s| s.access_token.as_ref()).is_some(),
-            "deviceId": sess.as_ref().and_then(|s| s.device_id.clone()),
-            "socketPath": socket_path().to_string_lossy().to_string(),
-            "sessionFile": session_file().to_string_lossy().to_string(),
-        });
-        return SocketResponseBody::Result { result: info };
-    }
-    if method == "auth_session_raw" {
-        let sess = state.session.lock().await;
-        let value = sess.as_ref().map(|s| s.auth_session.clone());
-        return SocketResponseBody::Result {
-            result: serde_json::json!(value),
-        };
-    }
-    if method == "auth_logout" {
-        clear_session();
-        *state.session.lock().await = None;
-        *state.webview.lock().await = None;
-        return SocketResponseBody::Result {
-            result: serde_json::json!({ "ok": true }),
-        };
-    }
+    req: SocketReq,
+) -> (serde_json::Value, Option<mpsc::Receiver<ProtocolResponse>>) {
+    let req_id = req
+        .id
+        .as_ref()
+        .and_then(|v| v.as_str())
+        .unwrap_or("req_1")
+        .to_string();
 
-    let win = {
-        let g = state.webview.lock().await;
-        match g.as_ref() {
-            Some(w) => w.clone(),
-            None => {
-                return SocketResponseBody::Error {
-                    error: SocketError {
-                        code: -32002,
-                        message: "not logged in; no webview available".to_string(),
-                    },
-                };
+    match req.method.as_str() {
+        "auth.status" | "auth_status" => {
+            let inner = state.inner.lock().await;
+            let is_authed = inner.session.is_some() && inner.auth_state == AuthState::Ready;
+            let user_info = inner
+                .session
+                .as_ref()
+                .map(|s| s.get_user_info())
+                .unwrap_or(serde_json::Value::Null);
+
+            let res = serde_json::json!({
+                "version": PROTOCOL_VERSION,
+                "id": req_id,
+                "type": "result",
+                "result": {
+                    "running": true,
+                    "authenticated": is_authed,
+                    "user": user_info,
+                    "authState": inner.auth_state
+                }
+            });
+            (res, None)
+        }
+        "auth.login" | "auth_login" => {
+            let handle = app_handle.clone();
+            let state_clone = state.clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = trigger_login(&handle, &state_clone).await;
+            });
+            let res = serde_json::json!({
+                "version": PROTOCOL_VERSION,
+                "id": req_id,
+                "type": "result",
+                "result": { "ok": true }
+            });
+            (res, None)
+        }
+        "auth.logout" | "auth_logout" => {
+            let handle = app_handle.clone();
+            let state_clone = state.clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = trigger_logout(&handle, &state_clone).await;
+            });
+            let res = serde_json::json!({
+                "version": PROTOCOL_VERSION,
+                "id": req_id,
+                "type": "result",
+                "result": { "ok": true }
+            });
+            (res, None)
+        }
+        _ => {
+            let router = {
+                let r_guard = state.router.lock().await;
+                r_guard.clone()
+            };
+
+            if let Some(router) = router {
+                if req.method == "chat.stream" {
+                    let (tx, rx) = mpsc::channel::<ProtocolResponse>(32);
+                    let router_clone = router.clone();
+                    let proto_req = ProtocolRequest::new(req_id.clone(), req.method, req.params);
+                    tokio::spawn(async move {
+                        let _ = router_clone.route_stream(proto_req, tx).await;
+                    });
+                    (serde_json::Value::Null, Some(rx))
+                } else {
+                    let proto_req = ProtocolRequest::new(req_id, req.method, req.params);
+                    let resp = router.route_request(proto_req).await;
+                    let val = serde_json::to_value(&resp).unwrap_or_default();
+                    (val, None)
+                }
+            } else {
+                let err_res = serde_json::json!({
+                    "version": PROTOCOL_VERSION,
+                    "id": req_id,
+                    "type": "error",
+                    "error": {
+                        "code": "PROVIDER_UNAVAILABLE",
+                        "message": "Router not initialized"
+                    }
+                });
+                (err_res, None)
             }
         }
-    };
-
-    let params_value = params
-        .map(serde_json::Value::Object)
-        .unwrap_or(serde_json::Value::Object(Default::default()));
-
-    let raw = match webview_rpc(&win, &state.pending_calls, method, &params_value).await {
-        Ok(s) => s,
-        Err(e) => {
-            return SocketResponseBody::Error {
-                error: SocketError { code: -32000, message: e },
-            };
-        }
-    };
-
-    let parsed: serde_json::Value = match serde_json::from_str(&raw) {
-        Ok(v) => v,
-        Err(e) => {
-            return SocketResponseBody::Error {
-                error: SocketError {
-                    code: -32000,
-                    message: format!("bad response json: {e}"),
-                },
-            };
-        }
-    };
-
-    if parsed.get("ok").and_then(|v| v.as_bool()) == Some(true) {
-        SocketResponseBody::Result {
-            result: parsed.get("result").cloned().unwrap_or(serde_json::Value::Null),
-        }
-    } else {
-        let msg = parsed
-            .get("error")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown error")
-            .to_string();
-        SocketResponseBody::Error {
-            error: SocketError { code: -1, message: msg },
-        }
     }
 }
 
-async fn handle_socket_conn(state: AppState, stream: UnixStream) {
+async fn handle_socket_connection(app_handle: AppHandle, state: AppState, stream: UnixStream) {
     let (rx, mut tx) = tokio::io::split(stream);
     let mut reader = BufReader::new(rx);
+    let mut line = String::new();
 
     loop {
-        let mut line = String::new();
+        line.clear();
         let n = match reader.read_line(&mut line).await {
             Ok(0) => break,
             Ok(n) => n,
-            Err(e) => {
-                eprintln!("socket read error: {e}");
-                break;
-            }
+            Err(_) => break,
         };
         if n == 0 {
             break;
         }
-        let line = line.trim();
-        if line.is_empty() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
             continue;
         }
 
-        let send_err = |code: i32,
-                        msg: String,
-                        id: Option<&serde_json::Value>|
-         -> Option<String> {
-            let resp = SocketResponse {
-                id,
-                body: SocketResponseBody::Error {
-                    error: SocketError { code, message: msg },
-                },
-            };
-            serde_json::to_string(&resp)
-                .map(|mut s| {
-                    s.push('\n');
-                    s
-                })
-                .ok()
-        };
-
-        let reqs: Vec<SocketRequest> = if line.starts_with('[') {
-            match serde_json::from_str(line) {
-                Ok(v) => v,
-                Err(e) => {
-                    if let Some(buf) = send_err(-32700, e.to_string(), None) {
-                        let _ = tx.write_all(buf.as_bytes()).await;
-                    }
-                    continue;
-                }
-            }
-        } else {
-            match serde_json::from_str::<SocketRequest>(line) {
-                Ok(r) => vec![r],
-                Err(e) => {
-                    if let Some(buf) = send_err(-32700, e.to_string(), None) {
-                        let _ = tx.write_all(buf.as_bytes()).await;
-                    }
-                    continue;
-                }
-            }
-        };
-
-        let mut out: Vec<serde_json::Value> = Vec::with_capacity(reqs.len());
-        for req in &reqs {
-            let body = dispatch_call(&state, &req.method, req.params.clone()).await;
-            let resp = SocketResponse {
-                id: req.id.as_ref(),
-                body,
-            };
-            match serde_json::to_value(&resp) {
-                Ok(v) => out.push(v),
-                Err(e) => {
-                    let err = SocketResponse {
-                        id: req.id.as_ref(),
-                        body: SocketResponseBody::Error {
-                            error: SocketError {
-                                code: -32603,
-                                message: e.to_string(),
-                            },
-                        },
-                    };
-                    if let Ok(v) = serde_json::to_value(&err) {
-                        out.push(v);
-                    }
-                }
-            }
-        }
-
-        let buf = if line.starts_with('[') {
-            serde_json::to_string(&out).map(|mut s| {
-                s.push('\n');
-                s
-            })
-        } else {
-            out.into_iter()
-                .next()
-                .ok_or_else(|| "empty".to_string())
-                .and_then(|v| serde_json::to_string(&v).map_err(|e| e.to_string()))
-                .map(|mut s| {
-                    s.push('\n');
-                    s
-                })
-        };
-        match buf {
-            Ok(buf) => {
-                if tx.write_all(buf.as_bytes()).await.is_err() {
-                    break;
-                }
-            }
+        let req: SocketReq = match serde_json::from_str(trimmed) {
+            Ok(r) => r,
             Err(e) => {
-                eprintln!("socket serialize error: {e}");
-                break;
+                let err = serde_json::json!({
+                    "version": PROTOCOL_VERSION,
+                    "id": "req_unknown",
+                    "type": "error",
+                    "error": { "code": "INVALID_REQUEST", "message": e.to_string() }
+                });
+                let mut out = serde_json::to_string(&err).unwrap_or_default();
+                out.push('\n');
+                let _ = tx.write_all(out.as_bytes()).await;
+                continue;
+            }
+        };
+
+        let (res_val, stream_rx) = dispatch_socket_request(&app_handle, &state, req).await;
+
+        if let Some(mut rx) = stream_rx {
+            while let Some(item) = rx.recv().await {
+                if let Ok(mut json) = serde_json::to_string(&item) {
+                    json.push('\n');
+                    if tx.write_all(json.as_bytes()).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        } else if !res_val.is_null() {
+            if let Ok(mut out) = serde_json::to_string(&res_val) {
+                out.push('\n');
+                let _ = tx.write_all(out.as_bytes()).await;
             }
         }
     }
 }
 
-async fn socket_server_loop(state: AppState) {
-    let path = socket_path();
-    let _ = fs::remove_file(&path);
+async fn run_socket_server(app_handle: AppHandle, state: AppState) {
+    let path = determine_socket_path();
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
+    let _ = fs::remove_file(&path);
 
     let listener = match UnixListener::bind(&path) {
         Ok(l) => {
-            println!("[ai-core] socket listening on {}", path.display());
+            set_socket_permissions(&path);
+            println!("[ai-core] Unix socket listener started at {}", path.display());
             l
         }
         Err(e) => {
-            eprintln!("[ai-core] FATAL: cannot bind socket {}: {e}", path.display());
+            eprintln!("[ai-core] Cannot bind Unix socket at {}: {e}", path.display());
             return;
         }
     };
 
     loop {
         match listener.accept().await {
-            Ok((stream, _addr)) => {
-                let state = state.clone();
+            Ok((stream, _)) => {
+                let handle = app_handle.clone();
+                let st = state.clone();
                 tokio::spawn(async move {
-                    handle_socket_conn(state, stream).await;
+                    handle_socket_connection(handle, st, stream).await;
                 });
             }
-            Err(e) => {
-                eprintln!("[ai-core] socket accept error: {e}");
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            Err(_) => {
+                tokio::time::sleep(Duration::from_millis(200)).await;
             }
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Tauri commands (minimal — primary API is the socket)
+// System Tray Setup
+// ---------------------------------------------------------------------------
+
+fn setup_system_tray(app: &AppHandle, state: AppState) -> Result<(), Box<dyn std::error::Error>> {
+    let header = MenuItem::with_id(app, "header", "AICore Background App", false, None::<&str>)?;
+    let open = MenuItem::with_id(app, "open", "Open", true, None::<&str>)?;
+    let status = MenuItem::with_id(
+        app,
+        "auth_status",
+        "Authentication Status",
+        true,
+        None::<&str>,
+    )?;
+    let login = MenuItem::with_id(app, "login", "Login", true, None::<&str>)?;
+    let logout = MenuItem::with_id(app, "logout", "Logout", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+
+    let menu = Menu::with_items(app, &[&header, &open, &status, &login, &logout, &quit])?;
+
+    let handle = app.clone();
+    let state_clone = state.clone();
+
+    let _tray = TrayIconBuilder::new()
+        .icon(app.default_window_icon().unwrap().clone())
+        .menu(&menu)
+        .show_menu_on_left_click(true)
+        .on_menu_event(move |_app, event| match event.id.as_ref() {
+            "open" | "auth_status" => {
+                if let Some(win) = handle.get_webview_window("main") {
+                    let _ = win.show();
+                    let _ = win.set_focus();
+                }
+            }
+            "login" => {
+                let h = handle.clone();
+                let st = state_clone.clone();
+                tauri::async_runtime::spawn(async move {
+                    let _ = trigger_login(&h, &st).await;
+                });
+            }
+            "logout" => {
+                let h = handle.clone();
+                let st = state_clone.clone();
+                tauri::async_runtime::spawn(async move {
+                    let _ = trigger_logout(&h, &st).await;
+                });
+            }
+            "quit" => {
+                std::process::exit(0);
+            }
+            _ => {}
+        })
+        .build(app)?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tauri Commands
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
-}
+async fn auth_status_command(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let inner = state.inner.lock().await;
+    let is_authed = inner.session.is_some() && inner.auth_state == AuthState::Ready;
+    let user_info = inner
+        .session
+        .as_ref()
+        .map(|s| s.get_user_info())
+        .unwrap_or(serde_json::Value::Null);
 
-#[tauri::command]
-async fn auth_status_command(
-    state: tauri::State<'_, AppState>,
-) -> Result<serde_json::Value, String> {
-    let s = &*state;
-    let sess = s.session.lock().await;
-    let has_webview = s.webview.lock().await.is_some();
     Ok(serde_json::json!({
-        "loggedIn": sess.is_some(),
-        "hasWebview": has_webview,
-        "storedAt": sess.as_ref().map(|x| x.stored_at),
-        "socketPath": socket_path().to_string_lossy().to_string(),
-        "sessionFile": session_file().to_string_lossy().to_string(),
+        "running": true,
+        "authenticated": is_authed,
+        "authState": inner.auth_state,
+        "user": user_info,
+        "socketPath": determine_socket_path().to_string_lossy().to_string(),
     }))
 }
 
-#[tauri::command]
-fn socket_path_command() -> String {
-    socket_path().to_string_lossy().to_string()
-}
-
 // ---------------------------------------------------------------------------
-// Entrypoint
+// Application Entrypoint
 // ---------------------------------------------------------------------------
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let _ = fs::create_dir_all(data_dir());
-
     let state = AppState::default();
+
+    // Initialize storage & router
+    let socket_p = determine_socket_path();
+    let db_path = socket_p
+        .parent()
+        .unwrap_or(&PathBuf::from("."))
+        .join("aicore.db");
+    if let Ok(storage) = Storage::new(db_path) {
+        let storage_arc = Arc::new(storage);
+        let router = Arc::new(RequestRouter::new(storage_arc));
+        let router_mutex = state.router.clone();
+        tauri::async_runtime::spawn(async move {
+            *router_mutex.lock().await = Some(router);
+        });
+    }
+
     let state_for_setup = state.clone();
     let state_for_socket = state.clone();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .manage(state)
-        .invoke_handler(tauri::generate_handler![
-            greet,
-            auth_status_command,
-            socket_path_command
-        ])
+        .manage(state.clone())
+        .invoke_handler(tauri::generate_handler![auth_status_command])
         .setup(move |app| {
             let handle = app.handle().clone();
-            {
-                let win = handle
-                    .get_webview_window("main")
-                    .expect("main window must exist");
-                register_navigation_handler(&win, state_for_setup.clone())
-                    .expect("failed to register navigation handler");
+
+            // Setup system tray
+            let _ = setup_system_tray(&handle, state_for_setup.clone());
+
+            // Window close requested event -> hide to tray instead of quitting
+            if let Some(win) = handle.get_webview_window("main") {
+                let _ = register_navigation_handler(&win, state_for_setup.clone());
+                win.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        if let Some(w) = handle.get_webview_window("main") {
+                            let _ = w.hide();
+                        }
+                    }
+                });
             }
 
+            // Spawn startup check & Unix socket server
+            let handle_for_check = app.handle().clone();
+            let state_check = state_for_setup.clone();
             tauri::async_runtime::spawn(async move {
-                let restored = try_restore_without_ui(&handle, &state_for_setup)
-                    .await
-                    .unwrap_or(false);
+                initialize_and_check_session(handle_for_check, state_check).await;
+            });
 
-                if !restored {
-                    println!("[ai-core] no valid session; starting login flow");
-                    if let Err(e) = run_auth_flow(handle.clone(), &state_for_setup).await {
-                        eprintln!("[ai-core] auth flow failed: {e}");
-                    } else {
-                        println!("[ai-core] login successful");
-                    }
-                } else {
-                    println!("[ai-core] session restored without UI");
-                }
-
-                socket_server_loop(state_for_socket).await;
+            let handle_for_socket = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                run_socket_server(handle_for_socket, state_for_socket).await;
             });
 
             Ok(())

@@ -8,4 +8,5 @@ members = [
     "crates/aicore-core",
     "crates/aicore-server",
     "crates/aicore-cli",
+    "src-tauri",
 ]
